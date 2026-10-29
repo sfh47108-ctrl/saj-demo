@@ -1,0 +1,103 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function fresh() { return request.time.toMillis() < (request.auth.token.auth_time + 28800) * 1000; }
+    function r() { return fresh() ? request.auth.token.role : 'none'; }
+    function ok(d) {
+      return request.auth != null && (
+        r() == 'admin' ||
+        (r() == 'teacher' && d.key in request.auth.token.classes) ||
+        (r() == 'parent' && d.gr == request.auth.token.gr));
+    }
+    function inc() { return request.auth.token.get('inc', false) == true; }
+    function tw(k) { return r() == 'admin' || (r() == 'teacher' && !inc() && k in request.auth.token.classes); }
+    function teach(k) { return r() == 'admin' || (r() == 'teacher' && k in request.auth.token.classes); }
+    match /students/{id} {
+      allow read: if ok(resource.data);
+      allow write: if false;   // only via /api/rpc (admin)
+    }
+    match /hw/{id} {
+      allow read: if request.auth != null && (r() == 'admin' ||
+        (r() == 'teacher' && resource.data.key in request.auth.token.classes) ||
+        (r() == 'parent' && resource.data.key == request.auth.token.ck));
+      allow create: if request.auth != null && tw(request.resource.data.key) && request.resource.data.by == request.auth.uid;
+      allow update, delete: if request.auth != null && tw(resource.data.key) && (r() == 'admin' || resource.data.by == request.auth.uid);
+    }
+    match /notices/{id} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && r() == 'admin';
+    }
+    match /pnotices/{id} {
+      allow read: if request.auth != null && (r() == 'admin' || (r() == 'parent' && resource.data.gr == request.auth.token.gr));
+      allow write: if request.auth != null && r() == 'admin';
+    }
+    match /events/{id} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && r() == 'admin';
+    }
+    // Class settings (subjects and grading scale): everyone staff can read, only admin/principal can write.
+    match /cfg/{id} {
+      allow read: if request.auth != null && (r() == 'admin' || r() == 'teacher' || (r() == 'parent' && id == 'settings'));
+      allow write: if request.auth != null && r() == 'admin';
+    }
+    // Parents can see their own child's result only when admin turned results ON and the student is not on hold (dues).
+    function parentOk(d) {
+      return r() == 'parent' && d.gr == request.auth.token.gr
+        && exists(/databases/$(database)/documents/cfg/settings)
+        && get(/databases/$(database)/documents/cfg/settings).data.get('parentResults', false) == true
+        && get(/databases/$(database)/documents/students/$(d.gr)).data.get('hold', false) == false;
+    }
+    // Results: the class teacher saves a result and it becomes LOCKED (locked == true).
+    // A teacher can only change an unlocked result, or ask for an edit (req field). Admin/principal approve (unlock) or reject.
+    match /results/{id} {
+      allow read: if request.auth != null && (r() == 'admin' || (r() == 'teacher' && resource.data.key in request.auth.token.classes) || parentOk(resource.data));
+      allow create: if request.auth != null && r() == 'teacher' && !inc() && request.resource.data.key in request.auth.token.classes
+                    && sameClass(request.resource.data)
+                    && request.resource.data.locked == true
+                    && id == request.resource.data.year + '_' + request.resource.data.term + '_' + request.resource.data.gr;
+      allow update: if request.auth != null && (
+                    (r() == 'teacher' && resource.data.key in request.auth.token.classes && request.resource.data.key in request.auth.token.classes
+                      && sameClass(request.resource.data)
+                      && resource.data.get('locked', false) == false
+                      && request.resource.data.locked == true
+                      && request.resource.data.gr == resource.data.gr && request.resource.data.term == resource.data.term && request.resource.data.year == resource.data.year)
+                    ||
+                    (r() == 'teacher' && resource.data.key in request.auth.token.classes
+                      && resource.data.get('locked', false) == true
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['req'])
+                      && request.resource.data.req.status == 'pending' && request.resource.data.req.by == request.auth.uid)
+                    ||
+                    (r() == 'admin' && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['locked', 'req']))
+                  );
+      allow delete: if request.auth != null && r() == 'teacher' && resource.data.key in request.auth.token.classes && resource.data.get('locked', false) == false;
+    }
+    function sameClass(d) { return get(/databases/$(database)/documents/students/$(d.gr)).data.key == d.key; }
+    // Attendance: the class teacher marks it, then presses "Complete & Lock" (creates an attlock document).
+    // After that only admin/principal can change it. Incharges can only read.
+    // Teachers can only write attendance for today (+/- 1 day tolerance for time zones). Only admin can touch past days.
+    function dstr(t) { return string(t.year()) + '-' + (t.month() < 10 ? '0' : '') + string(t.month()) + '-' + (t.day() < 10 ? '0' : '') + string(t.day()); }
+    function recentDay(d) { return d == dstr(request.time) || d == dstr(request.time - duration.value(1, 'd')) || d == dstr(request.time + duration.value(1, 'd')); }
+    function lockedAtt(d) { return exists(/databases/$(database)/documents/attlock/$(d.date + '_' + d.key)); }
+    match /attlock/{id} {
+      allow read: if request.auth != null && (r() == 'admin' || (r() == 'teacher' && resource.data.key in request.auth.token.classes));
+      allow create: if request.auth != null && r() == 'teacher' && !inc() && request.resource.data.key in request.auth.token.classes
+                    && id == request.resource.data.date + '_' + request.resource.data.key && recentDay(request.resource.data.date);
+      allow delete: if request.auth != null && r() == 'admin';
+      allow update: if false;
+    }
+    match /att/{id} {
+      allow read: if ok(resource.data);
+      allow create: if request.auth != null && tw(request.resource.data.key)
+                    && (r() == 'admin' || (!lockedAtt(request.resource.data) && recentDay(request.resource.data.date)))
+                    && sameClass(request.resource.data)
+                    && id == request.resource.data.date + '_' + request.resource.data.gr
+                    && request.resource.data.status in ['P','A','L','V'];
+      allow update: if request.auth != null && tw(resource.data.key) && tw(request.resource.data.key)
+                    && (r() == 'admin' || (!lockedAtt(resource.data) && recentDay(resource.data.date)))
+                    && sameClass(request.resource.data)
+                    && request.resource.data.gr == resource.data.gr && request.resource.data.date == resource.data.date
+                    && request.resource.data.status in ['P','A','L','V'];
+      allow delete: if request.auth != null && r() == 'admin';
+    }
+  }
+}
